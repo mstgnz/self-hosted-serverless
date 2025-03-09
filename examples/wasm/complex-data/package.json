@@ -1,0 +1,22 @@
+{
+  "name": "wasm-complex-data",
+  "version": "1.0.0",
+  "description": "Complex data handling with AssemblyScript WebAssembly",
+  "main": "index.js",
+  "scripts": {
+    "asbuild:untouched": "asc index.ts -b build/untouched.wasm -t build/untouched.wat --sourceMap --debug",
+    "asbuild:optimized": "asc index.ts -b build/optimized.wasm -t build/optimized.wat --sourceMap --optimize",
+    "asbuild": "npm run asbuild:untouched && npm run asbuild:optimized",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "webassembly",
+    "assemblyscript",
+    "serverless"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "assemblyscript": "^0.27.1"
+  }
+} 
