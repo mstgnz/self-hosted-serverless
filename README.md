@@ -22,6 +22,7 @@ Functions can run as independent containers or processes, with a central dispatc
 - **Lightweight Runtime**: Minimal resource footprint with maximum performance
 - **Simple CLI**: Easy function management and deployment
 - **Docker Ready**: Containerized deployment with included configurations
+- **Function Metrics**: Track execution times, error rates, and cold starts
 
 ## 🛠️ Technical Architecture
 
@@ -30,6 +31,7 @@ Functions can run as independent containers or processes, with a central dispatc
 - **Multi-Language Support**: Write functions in Go or any WebAssembly-compatible language
 - **Scalable Design**: Process requests efficiently using goroutines and channels
 - **Simple Integration**: Easy to connect with API gateways and database systems
+- **Observability**: Built-in metrics collection for function performance monitoring
 
 ## 🌐 Installation
 
@@ -97,6 +99,30 @@ Execute database queries through the API:
 curl -X POST http://localhost:8080/db -d '{"query": "SELECT * FROM users", "args": []}'
 ```
 
+### Monitoring Functions
+
+**View metrics for all functions:**
+
+```sh
+go run cmd/main.go metrics
+```
+
+**View metrics for a specific function:**
+
+```sh
+go run cmd/main.go metrics myFunction
+```
+
+**Via HTTP API:**
+
+```sh
+# Get metrics for all functions
+curl http://localhost:8080/metrics
+
+# Get metrics for a specific function
+curl http://localhost:8080/metrics/myFunction
+```
+
 ## 🎯 Use Cases
 
 - **API Backends**: Create lightweight API services with minimal overhead
@@ -105,6 +131,7 @@ curl -X POST http://localhost:8080/db -d '{"query": "SELECT * FROM users", "args
 - **Machine Learning Inference**: Serve ML models with low latency
 - **Real-Time Notifications**: Build event-driven notification systems
 - **Database Operations**: Perform database operations without managing connections
+- **Performance Monitoring**: Track function performance and identify bottlenecks
 
 ## 🔧 Development
 
@@ -121,9 +148,9 @@ go test ./...  # Run tests before submitting
 ## 🗺️ Roadmap
 
 - [x] WebAssembly Support
+- [x] Function metrics and observability
 - [ ] Advanced CLI with monitoring capabilities
 - [ ] Kubernetes integration for orchestrated deployment
-- [ ] Function metrics and observability
 - [ ] Enhanced security features
 
 ## 📄 License

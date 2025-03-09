@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"plugin"
 	"sync"
+	"time"
 
 	"github.com/mstgnz/self-hosted-serverless/internal/common"
 	"github.com/mstgnz/self-hosted-serverless/internal/runtime"
@@ -29,7 +30,7 @@ type WasmFunctionHandler struct {
 }
 
 // Execute executes a WebAssembly function
-func (h *WasmFunctionHandler) Execute(input map[string]any) (any, error) {
+func (h *WasmFunctionHandler) Execute(input map[string]interface{}) (interface{}, error) {
 	return h.runtime.ExecuteFunction(h.wasmFile, h.exportName, input)
 }
 
@@ -38,6 +39,7 @@ type Registry struct {
 	functions   map[string]common.FunctionHandler
 	metadata    map[string]common.FunctionInfo
 	wasmRuntime *runtime.WasmRuntime
+	metrics     *MetricsCollector
 	mutex       sync.RWMutex
 }
 
@@ -54,6 +56,7 @@ func NewRegistry() *Registry {
 		functions:   make(map[string]common.FunctionHandler),
 		metadata:    make(map[string]common.FunctionInfo),
 		wasmRuntime: wasmRuntime,
+		metrics:     NewMetricsCollector(),
 	}
 
 	// Load all functions from the functions directory
@@ -88,7 +91,7 @@ func (r *Registry) RegisterWasmFunction(name string, wasmFile string, exportName
 }
 
 // Execute executes a function by name
-func (r *Registry) Execute(name string, input map[string]any) (any, error) {
+func (r *Registry) Execute(name string, input map[string]interface{}) (interface{}, error) {
 	r.mutex.RLock()
 	handler, exists := r.functions[name]
 	r.mutex.RUnlock()
@@ -97,7 +100,15 @@ func (r *Registry) Execute(name string, input map[string]any) (any, error) {
 		return nil, fmt.Errorf("function %s not found", name)
 	}
 
-	return handler.Execute(input)
+	// Record execution metrics
+	startTime := time.Now()
+	result, err := handler.Execute(input)
+	duration := time.Since(startTime)
+
+	// Record metrics
+	r.metrics.RecordExecution(name, duration, err)
+
+	return result, err
 }
 
 // ListFunctions returns a list of all registered functions
@@ -111,6 +122,16 @@ func (r *Registry) ListFunctions() []common.FunctionInfo {
 	}
 
 	return functions
+}
+
+// GetMetrics returns metrics for all functions
+func (r *Registry) GetMetrics() map[string]FunctionMetrics {
+	return r.metrics.GetMetrics()
+}
+
+// GetFunctionMetrics returns metrics for a specific function
+func (r *Registry) GetFunctionMetrics(name string) (FunctionMetrics, bool) {
+	return r.metrics.GetFunctionMetrics(name)
 }
 
 // loadFunctions loads all functions from the functions directory

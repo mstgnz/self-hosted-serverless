@@ -48,6 +48,12 @@ func main() {
 		cli.RunFunction(args[1])
 	case "list":
 		cli.ListFunctions()
+	case "metrics":
+		if len(args) > 1 {
+			cli.GetFunctionMetrics(args[1])
+		} else {
+			cli.GetMetrics()
+		}
 	case "":
 		// Start the server if no command is provided
 		registry := function.NewRegistry()
@@ -81,7 +87,7 @@ func main() {
 		grpcSrv.Stop()
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
-		fmt.Println("Available commands: create, run, list")
+		fmt.Println("Available commands: create, run, list, metrics")
 		os.Exit(1)
 	}
 }

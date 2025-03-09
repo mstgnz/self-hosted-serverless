@@ -50,6 +50,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/functions", s.handleListFunctions)
 	mux.HandleFunc("/events", s.handlePublishEvent)
 	mux.HandleFunc("/db", s.handleDatabaseQuery)
+	mux.HandleFunc("/metrics", s.handleGetMetrics)
+	mux.HandleFunc("/metrics/", s.handleGetFunctionMetrics)
 
 	// Create HTTP server
 	s.server = &http.Server{
@@ -260,4 +262,49 @@ func (s *Server) handleDatabaseQuery(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"results": results,
 	})
+}
+
+// handleGetMetrics handles requests to get metrics for all functions
+func (s *Server) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get metrics from the registry
+	metrics := s.registry.GetMetrics()
+
+	// Return the metrics
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"metrics": metrics,
+	})
+}
+
+// handleGetFunctionMetrics handles requests to get metrics for a specific function
+func (s *Server) handleGetFunctionMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract function name from URL path
+	path := strings.TrimPrefix(r.URL.Path, "/metrics/")
+	if path == "" {
+		http.Error(w, "Function name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Get metrics for the function
+	metrics, exists := s.registry.GetFunctionMetrics(path)
+	if !exists {
+		http.Error(w, fmt.Sprintf("Function %s not found", path), http.StatusNotFound)
+		return
+	}
+
+	// Return the metrics
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(metrics)
 }

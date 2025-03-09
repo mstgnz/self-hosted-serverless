@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"text/template"
+	"time"
 )
 
 const (
@@ -157,5 +158,120 @@ func ListFunctions() {
 	fmt.Println("Available functions:")
 	for _, function := range result.Functions {
 		fmt.Printf("  %s - %s (%s)\n", function.Name, function.Description, function.Runtime)
+	}
+}
+
+// GetMetrics gets metrics for all functions
+func GetMetrics() {
+	// Make a request to the metrics endpoint
+	resp, err := http.Get("http://localhost:8080/metrics")
+	if err != nil {
+		log.Fatalf("Failed to get metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse the response
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Fatalf("Failed to parse metrics response: %v", err)
+	}
+
+	// Print the metrics
+	fmt.Println("Function Metrics:")
+	fmt.Println("================")
+
+	metrics, ok := result["metrics"].(map[string]interface{})
+	if !ok {
+		fmt.Println("No metrics available")
+		return
+	}
+
+	if len(metrics) == 0 {
+		fmt.Println("No functions have been executed yet")
+		return
+	}
+
+	for name, metricData := range metrics {
+		metric, ok := metricData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		fmt.Printf("Function: %s\n", name)
+		fmt.Printf("  Executions: %v\n", metric["execution_count"])
+		fmt.Printf("  Errors: %v\n", metric["error_count"])
+
+		// Format average duration
+		if avgDuration, ok := metric["average_duration"].(float64); ok {
+			fmt.Printf("  Average Duration: %v\n", time.Duration(avgDuration))
+		}
+
+		// Format last execution time
+		if lastExecStr, ok := metric["last_execution_time"].(string); ok {
+			if lastExec, err := time.Parse(time.RFC3339, lastExecStr); err == nil {
+				fmt.Printf("  Last Execution: %v\n", lastExec.Format(time.RFC3339))
+			}
+		}
+
+		// Format cold start info
+		if coldStarts, ok := metric["cold_start_count"].(float64); ok {
+			fmt.Printf("  Cold Starts: %v\n", int64(coldStarts))
+		}
+
+		if avgColdStart, ok := metric["avg_cold_start_latency"].(float64); ok {
+			fmt.Printf("  Average Cold Start Latency: %v\n", time.Duration(avgColdStart))
+		}
+
+		fmt.Println()
+	}
+}
+
+// GetFunctionMetrics gets metrics for a specific function
+func GetFunctionMetrics(functionName string) {
+	// Make a request to the function metrics endpoint
+	resp, err := http.Get(fmt.Sprintf("http://localhost:8080/metrics/%s", functionName))
+	if err != nil {
+		log.Fatalf("Failed to get metrics for function %s: %v", functionName, err)
+	}
+	defer resp.Body.Close()
+
+	// Check if the function was found
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Printf("Function %s not found\n", functionName)
+		return
+	}
+
+	// Parse the response
+	var metric map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&metric); err != nil {
+		log.Fatalf("Failed to parse metrics response: %v", err)
+	}
+
+	// Print the metrics
+	fmt.Printf("Metrics for function: %s\n", functionName)
+	fmt.Println("================")
+
+	fmt.Printf("Executions: %v\n", metric["execution_count"])
+	fmt.Printf("Errors: %v\n", metric["error_count"])
+
+	// Format average duration
+	if avgDuration, ok := metric["average_duration"].(float64); ok {
+		fmt.Printf("Average Duration: %v\n", time.Duration(avgDuration))
+	}
+
+	// Format last execution time
+	if lastExecStr, ok := metric["last_execution_time"].(string); ok {
+		if lastExec, err := time.Parse(time.RFC3339, lastExecStr); err == nil {
+			fmt.Printf("Last Execution: %v\n", lastExec.Format(time.RFC3339))
+		}
+	}
+
+	// Format cold start info
+	if coldStarts, ok := metric["cold_start_count"].(float64); ok {
+		fmt.Printf("Cold Starts: %v\n", int64(coldStarts))
+	}
+
+	if avgColdStart, ok := metric["avg_cold_start_latency"].(float64); ok {
+		fmt.Printf("Average Cold Start Latency: %v\n", time.Duration(avgColdStart))
 	}
 }
