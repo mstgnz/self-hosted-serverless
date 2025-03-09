@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package function;
+
+option go_package = "github.com/mstgnz/self-hosted-serverless/internal/grpc/proto";
+
+// FunctionService provides a gRPC interface for the serverless framework
+service FunctionService {
+  // ExecuteFunction executes a serverless function
+  rpc ExecuteFunction(ExecuteFunctionRequest) returns (ExecuteFunctionResponse) {}
+  
+  // ListFunctions lists all available functions
+  rpc ListFunctions(ListFunctionsRequest) returns (ListFunctionsResponse) {}
+}
+
+// ExecuteFunctionRequest represents a request to execute a function
+message ExecuteFunctionRequest {
+  string name = 1;
+  map<string, string> input = 2;
+}
+
+// ExecuteFunctionResponse represents the response from executing a function
+message ExecuteFunctionResponse {
+  bool success = 1;
+  map<string, string> result = 2;
+  string error = 3;
+}
+
+// ListFunctionsRequest represents a request to list all functions
+message ListFunctionsRequest {
+  // Empty request
+}
+
+// ListFunctionsResponse represents the response from listing all functions
+message ListFunctionsResponse {
+  repeated FunctionInfo functions = 1;
+}
+
+// FunctionInfo represents metadata about a function
+message FunctionInfo {
+  string name = 1;
+  string description = 2;
+  string runtime = 3;
+}
