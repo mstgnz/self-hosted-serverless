@@ -19,7 +19,17 @@
 
 # Go workspace file
 go.work
-go.work.sum
 
-# env file
+# IDE files
+.idea/
+.vscode/
+
+# Build artifacts
+bin/
+data/
+
+# Compiled proto files
+*.pb.go
+
+# Environment variables
 .env
