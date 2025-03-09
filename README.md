@@ -33,6 +33,17 @@ Functions can run as independent containers or processes, with a central dispatc
 - **Simple Integration**: Easy to connect with API gateways and database systems
 - **Observability**: Built-in metrics collection for function performance monitoring
 
+## 📚 Examples
+
+Check out the [examples directory](./examples) for detailed examples of all features:
+
+- [HTTP Functions](./examples/http)
+- [gRPC Functions](./examples/grpc)
+- [WebAssembly Functions](./examples/wasm)
+- [Database Integration](./examples/database)
+- [Event-Driven Architecture](./examples/events)
+- [Metrics and Observability](./examples/metrics)
+
 ## 🌐 Installation
 
 ### Requirements
