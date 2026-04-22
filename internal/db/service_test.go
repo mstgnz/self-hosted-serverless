@@ -95,15 +95,11 @@ func TestGetDB(t *testing.T) {
 
 // TestGetRedis tests the GetRedis method
 func TestGetRedis(t *testing.T) {
-	// Create a service with a mock Redis client
-	mockRedisClient := "mock-redis-client"
 	service := &Service{
-		dbType:      Redis,
-		redisClient: mockRedisClient,
+		dbType: Redis,
 	}
 
-	// Test GetRedis method
-	assert.Equal(t, mockRedisClient, service.GetRedis())
+	assert.Nil(t, service.GetRedis())
 }
 
 // TestClose tests the Close method

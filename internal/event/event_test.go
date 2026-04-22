@@ -17,15 +17,12 @@ func TestNewBus(t *testing.T) {
 func TestSubscribe(t *testing.T) {
 	bus := NewBus()
 
-	// Subscribe to an event
 	eventType := "test-event"
 
 	bus.Subscribe(eventType, func(ctx context.Context, event Event) error {
-		// Handler implementation
 		return nil
 	})
 
-	// Verify the handler was registered
 	assert.NotNil(t, bus.handlers[eventType])
 	assert.Equal(t, 1, len(bus.handlers[eventType]))
 }
@@ -37,7 +34,7 @@ func TestPublish(t *testing.T) {
 	// Subscribe to an event
 	eventType := "test-event"
 	handlerCalled := false
-	eventPayload := map[string]interface{}{"key": "value"}
+	eventPayload := map[string]any{"key": "value"}
 
 	var receivedEvent Event
 	var wg sync.WaitGroup
@@ -73,22 +70,17 @@ func TestPublish(t *testing.T) {
 func TestUnsubscribe(t *testing.T) {
 	bus := NewBus()
 
-	// Subscribe to an event
 	eventType := "test-event"
 
 	handler := func(ctx context.Context, event Event) error {
 		return nil
 	}
 
-	bus.Subscribe(eventType, handler)
+	cancel := bus.Subscribe(eventType, handler)
 	assert.Equal(t, 1, len(bus.handlers[eventType]))
 
-	// Unsubscribe from the event
-	bus.Unsubscribe(eventType, handler)
-
-	// This test might be flaky because we're comparing function references
-	// and the Unsubscribe implementation uses pointer comparison
-	// In a real implementation, we might want to use a more robust way to identify handlers
+	cancel()
+	assert.Equal(t, 0, len(bus.handlers[eventType]))
 }
 
 func TestGetGlobalBus(t *testing.T) {

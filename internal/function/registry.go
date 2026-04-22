@@ -1,12 +1,14 @@
 package function
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"plugin"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,52 +16,53 @@ import (
 	"github.com/mstgnz/self-hosted-serverless/internal/runtime"
 )
 
-// FunctionHandler is the interface that all serverless functions must implement
-// Deprecated: Use common.FunctionHandler instead
-type FunctionHandler = common.FunctionHandler
-
-// FunctionInfo represents metadata about a registered function
-// Deprecated: Use common.FunctionInfo instead
-type FunctionInfo = common.FunctionInfo
-
-// WasmFunctionHandler implements FunctionHandler for WebAssembly functions
+// WasmFunctionHandler implements FunctionHandler for WebAssembly functions using WASI stdio.
 type WasmFunctionHandler struct {
-	runtime    *runtime.WasmRuntime
-	wasmFile   string
-	exportName string
+	runtime  *runtime.WasmRuntime
+	wasmFile string
 }
 
-// Execute executes a WebAssembly function
-func (h *WasmFunctionHandler) Execute(input map[string]interface{}) (interface{}, error) {
-	return h.runtime.ExecuteFunction(h.wasmFile, h.exportName, input)
+func (h *WasmFunctionHandler) Execute(input map[string]any) (any, error) {
+	return h.runtime.ExecuteWASI(h.wasmFile, input)
+}
+
+type execResult struct {
+	value any
+	err   error
 }
 
 // Registry manages the serverless functions
 type Registry struct {
-	functions   map[string]common.FunctionHandler
-	metadata    map[string]common.FunctionInfo
-	wasmRuntime *runtime.WasmRuntime
-	metrics     *MetricsCollector
-	mutex       sync.RWMutex
+	functions       map[string]common.FunctionHandler
+	metadata        map[string]common.FunctionInfo
+	wasmRuntime     *runtime.WasmRuntime
+	metrics         *MetricsCollector
+	mutex           sync.RWMutex
+	functionTimeout time.Duration
 }
 
 // NewRegistry creates a new function registry
 func NewRegistry() *Registry {
-	// Initialize WebAssembly runtime
+	timeout := 30 * time.Second
+	if secs := os.Getenv("FUNCTION_TIMEOUT_SECS"); secs != "" {
+		if v, err := strconv.Atoi(secs); err == nil && v > 0 {
+			timeout = time.Duration(v) * time.Second
+		}
+	}
+
 	wasmRuntime, err := runtime.NewWasmRuntime()
 	if err != nil {
-		// Log error but continue without WebAssembly support
 		fmt.Printf("Warning: Failed to initialize WebAssembly runtime: %v\n", err)
 	}
 
 	registry := &Registry{
-		functions:   make(map[string]common.FunctionHandler),
-		metadata:    make(map[string]common.FunctionInfo),
-		wasmRuntime: wasmRuntime,
-		metrics:     NewMetricsCollector(),
+		functions:       make(map[string]common.FunctionHandler),
+		metadata:        make(map[string]common.FunctionInfo),
+		wasmRuntime:     wasmRuntime,
+		metrics:         NewMetricsCollector(),
+		functionTimeout: timeout,
 	}
 
-	// Load all functions from the functions directory
 	registry.loadFunctions()
 
 	return registry
@@ -75,23 +78,22 @@ func (r *Registry) Register(name string, handler common.FunctionHandler, info co
 }
 
 // RegisterWasmFunction registers a WebAssembly function
-func (r *Registry) RegisterWasmFunction(name string, wasmFile string, exportName string, info common.FunctionInfo) error {
+func (r *Registry) RegisterWasmFunction(name string, wasmFile string, info common.FunctionInfo) error {
 	if r.wasmRuntime == nil {
 		return errors.New("WebAssembly runtime not initialized")
 	}
 
 	handler := &WasmFunctionHandler{
-		runtime:    r.wasmRuntime,
-		wasmFile:   wasmFile,
-		exportName: exportName,
+		runtime:  r.wasmRuntime,
+		wasmFile: wasmFile,
 	}
 
 	r.Register(name, handler, info)
 	return nil
 }
 
-// Execute executes a function by name
-func (r *Registry) Execute(name string, input map[string]interface{}) (interface{}, error) {
+// Execute executes a function by name with a configurable timeout and panic recovery.
+func (r *Registry) Execute(name string, input map[string]any) (any, error) {
 	r.mutex.RLock()
 	handler, exists := r.functions[name]
 	r.mutex.RUnlock()
@@ -100,15 +102,30 @@ func (r *Registry) Execute(name string, input map[string]interface{}) (interface
 		return nil, fmt.Errorf("function %s not found", name)
 	}
 
-	// Record execution metrics
+	ctx, cancel := context.WithTimeout(context.Background(), r.functionTimeout)
+	defer cancel()
+
+	ch := make(chan execResult, 1)
+	go func() {
+		var res execResult
+		defer func() {
+			if rec := recover(); rec != nil {
+				res.err = fmt.Errorf("function panicked: %v", rec)
+			}
+			ch <- res
+		}()
+		res.value, res.err = handler.Execute(input)
+	}()
+
 	startTime := time.Now()
-	result, err := handler.Execute(input)
-	duration := time.Since(startTime)
-
-	// Record metrics
-	r.metrics.RecordExecution(name, duration, err)
-
-	return result, err
+	select {
+	case <-ctx.Done():
+		r.metrics.RecordExecution(name, time.Since(startTime), ctx.Err())
+		return nil, fmt.Errorf("function %s: execution timed out after %v", name, r.functionTimeout)
+	case res := <-ch:
+		r.metrics.RecordExecution(name, time.Since(startTime), res.err)
+		return res.value, res.err
+	}
 }
 
 // ListFunctions returns a list of all registered functions
@@ -138,7 +155,6 @@ func (r *Registry) GetFunctionMetrics(name string) (FunctionMetrics, bool) {
 func (r *Registry) loadFunctions() error {
 	functionsDir := "functions"
 
-	// Create the functions directory if it doesn't exist
 	if _, err := os.Stat(functionsDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(functionsDir, 0755); err != nil {
 			return fmt.Errorf("failed to create functions directory: %w", err)
@@ -146,25 +162,20 @@ func (r *Registry) loadFunctions() error {
 		return nil
 	}
 
-	// Walk through the functions directory
 	return filepath.WalkDir(functionsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Skip directories
 		if d.IsDir() {
 			return nil
 		}
 
-		// Handle different function types based on file extension
 		ext := filepath.Ext(path)
 		switch ext {
 		case ".so":
-			// Load Go plugin
 			return r.loadGoPlugin(path)
 		case ".wasm":
-			// Load WebAssembly module
 			if r.wasmRuntime != nil {
 				name := filepath.Base(path)
 				name = name[:len(name)-len(ext)]
@@ -173,7 +184,7 @@ func (r *Registry) loadFunctions() error {
 					Description: fmt.Sprintf("WebAssembly function: %s", name),
 					Runtime:     "wasm",
 				}
-				return r.RegisterWasmFunction(name, path, "execute", info)
+				return r.RegisterWasmFunction(name, path, info)
 			}
 		}
 
@@ -183,37 +194,31 @@ func (r *Registry) loadFunctions() error {
 
 // loadGoPlugin loads a Go plugin
 func (r *Registry) loadGoPlugin(path string) error {
-	// Load the plugin
 	p, err := plugin.Open(path)
 	if err != nil {
 		return fmt.Errorf("failed to load plugin %s: %w", path, err)
 	}
 
-	// Look up the Handler symbol
 	handlerSymbol, err := p.Lookup("Handler")
 	if err != nil {
 		return fmt.Errorf("plugin %s does not export Handler symbol: %w", path, err)
 	}
 
-	// Assert that the symbol is a FunctionHandler
 	handler, ok := handlerSymbol.(common.FunctionHandler)
 	if !ok {
 		return errors.New("plugin Handler is not a FunctionHandler")
 	}
 
-	// Look up the Info symbol
 	infoSymbol, err := p.Lookup("Info")
 	if err != nil {
 		return fmt.Errorf("plugin %s does not export Info symbol: %w", path, err)
 	}
 
-	// Assert that the symbol is a FunctionInfo
 	info, ok := infoSymbol.(common.FunctionInfo)
 	if !ok {
 		return errors.New("plugin Info is not a FunctionInfo")
 	}
 
-	// Register the function
 	r.Register(info.Name, handler, info)
 
 	return nil

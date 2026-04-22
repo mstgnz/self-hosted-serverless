@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mstgnz/self-hosted-serverless/internal/db"
@@ -14,29 +19,131 @@ import (
 	"github.com/mstgnz/self-hosted-serverless/internal/function"
 )
 
+var validFunctionName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// clientState tracks request timestamps for a single IP within the rate-limit window.
+type clientState struct {
+	requests []time.Time
+	lastSeen time.Time
+}
+
+// rateLimiter is a per-IP sliding-window rate limiter.
+type rateLimiter struct {
+	mu      sync.Mutex
+	clients map[string]*clientState
+	limit   int
+	window  time.Duration
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	rl := &rateLimiter{
+		clients: make(map[string]*clientState),
+		limit:   limit,
+		window:  window,
+	}
+	go rl.cleanupLoop()
+	return rl
+}
+
+func (rl *rateLimiter) allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+	state, ok := rl.clients[ip]
+	if !ok {
+		state = &clientState{}
+		rl.clients[ip] = state
+	}
+
+	// Drop requests outside the current window.
+	valid := state.requests[:0]
+	for _, t := range state.requests {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	state.requests = valid
+	state.lastSeen = now
+
+	if len(state.requests) >= rl.limit {
+		return false
+	}
+
+	state.requests = append(state.requests, now)
+	return true
+}
+
+// cleanupLoop evicts IPs that haven't been seen in two windows to prevent unbounded growth.
+func (rl *rateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(rl.window * 2)
+	defer ticker.Stop()
+	for range ticker.C {
+		rl.mu.Lock()
+		cutoff := time.Now().Add(-2 * rl.window)
+		for ip, state := range rl.clients {
+			if state.lastSeen.Before(cutoff) {
+				delete(rl.clients, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+// realIP extracts the client IP from the request, honouring common proxy headers.
+func realIP(r *http.Request) string {
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		return strings.SplitN(ip, ",", 2)[0]
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // Server represents the serverless HTTP server
 type Server struct {
 	port      int
+	apiKey    string
 	server    *http.Server
 	registry  *function.Registry
 	eventBus  *event.Bus
 	dbService *db.Service
+	limiter   *rateLimiter
 }
 
 // NewServer creates a new serverless server
 func NewServer(port int, registry *function.Registry) *Server {
-	// Initialize database service (using PostgreSQL by default)
+	apiKey := os.Getenv("API_KEY")
+	if apiKey == "" {
+		log.Println("Warning: API_KEY not set — all endpoints are unauthenticated")
+	}
+
+	rateLimit := 100
+	if v := os.Getenv("RATE_LIMIT_PER_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rateLimit = n
+		}
+	}
+
 	dbService, err := db.NewService(db.PostgreSQL)
 	if err != nil {
-		// Log error but continue without database support
 		log.Printf("Warning: Failed to initialize database service: %v\n", err)
 	}
 
 	return &Server{
 		port:      port,
+		apiKey:    apiKey,
 		registry:  registry,
 		eventBus:  event.GetGlobalBus(),
 		dbService: dbService,
+		limiter:   newRateLimiter(rateLimit, time.Minute),
 	}
 }
 
@@ -44,16 +151,14 @@ func NewServer(port int, registry *function.Registry) *Server {
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
-	// Register routes
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/run/", s.handleRunFunction)
-	mux.HandleFunc("/functions", s.handleListFunctions)
-	mux.HandleFunc("/events", s.handlePublishEvent)
-	mux.HandleFunc("/db", s.handleDatabaseQuery)
-	mux.HandleFunc("/metrics", s.handleGetMetrics)
-	mux.HandleFunc("/metrics/", s.handleGetFunctionMetrics)
+	mux.HandleFunc("/health", s.public(s.handleHealth))
+	mux.HandleFunc("/run/", s.protected(s.handleRunFunction))
+	mux.HandleFunc("/functions", s.protected(s.handleListFunctions))
+	mux.HandleFunc("/events", s.protected(s.handlePublishEvent))
+	mux.HandleFunc("/db", s.protected(s.handleDatabaseQuery))
+	mux.HandleFunc("/metrics", s.protected(s.handleGetMetrics))
+	mux.HandleFunc("/metrics/", s.protected(s.handleGetFunctionMetrics))
 
-	// Create HTTP server
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
 		Handler:      mux,
@@ -62,7 +167,6 @@ func (s *Server) Start() error {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Start the server
 	return s.server.ListenAndServe()
 }
 
@@ -71,7 +175,6 @@ func (s *Server) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Close database connection if it exists
 	if s.dbService != nil {
 		if err := s.dbService.Close(); err != nil {
 			log.Printf("Error closing database connection: %v", err)
@@ -81,60 +184,117 @@ func (s *Server) Stop() error {
 	return s.server.Shutdown(ctx)
 }
 
-// handleHealth handles health check requests
+// public wraps a handler with CORS and rate limiting (no auth)
+func (s *Server) public(h http.HandlerFunc) http.HandlerFunc {
+	return corsMiddleware(s.rateLimitMiddleware(h))
+}
+
+// protected wraps a handler with CORS, rate limiting, and API key auth
+func (s *Server) protected(h http.HandlerFunc) http.HandlerFunc {
+	return corsMiddleware(s.rateLimitMiddleware(s.authMiddleware(h)))
+}
+
+// corsMiddleware sets permissive CORS headers and handles preflight requests
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// rateLimitMiddleware rejects requests that exceed the per-IP rate limit.
+func (s *Server) rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.limiter.allow(realIP(r)) {
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// authMiddleware enforces API key authentication when API_KEY env var is set.
+// Clients must send the key via the X-API-Key header or as a Bearer token.
+func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" {
+			next(w, r)
+			return
+		}
+
+		key := r.Header.Get("X-API-Key")
+		if key == "" {
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				key = strings.TrimPrefix(auth, "Bearer ")
+			}
+		}
+
+		if key != s.apiKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// handleRunFunction handles function execution requests
 func (s *Server) handleRunFunction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Extract function name from URL path
-	path := strings.TrimPrefix(r.URL.Path, "/run/")
-	if path == "" {
+	name := strings.TrimPrefix(r.URL.Path, "/run/")
+	if name == "" {
 		http.Error(w, "Function name is required", http.StatusBadRequest)
 		return
 	}
+	if !validFunctionName.MatchString(name) {
+		http.Error(w, "Invalid function name", http.StatusBadRequest)
+		return
+	}
 
-	// Parse request body
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
 	var input map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Execute the function
-	result, err := s.registry.Execute(path, input)
+	result, err := s.registry.Execute(name, input)
 	if err != nil {
-		log.Printf("Error executing function %s: %v", path, err)
+		log.Printf("Error executing function %s: %v", name, err)
 		http.Error(w, fmt.Sprintf("Error executing function: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Publish function execution event
 	ctx := r.Context()
 	s.eventBus.Publish(ctx, event.Event{
 		Type: "function.executed",
 		Payload: map[string]any{
-			"function": path,
+			"function": name,
 			"input":    input,
 			"result":   result,
 		},
 	})
 
-	// Return the result
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(result)
 }
 
-// handleListFunctions handles listing all available functions
 func (s *Server) handleListFunctions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -150,25 +310,22 @@ func (s *Server) handleListFunctions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePublishEvent handles publishing events
 func (s *Server) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse request body
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var evt event.Event
 	if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Publish the event
 	ctx := r.Context()
 	errors := s.eventBus.Publish(ctx, evt)
 
-	// Return the result
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -177,20 +334,18 @@ func (s *Server) handlePublishEvent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDatabaseQuery handles database query requests
 func (s *Server) handleDatabaseQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Check if database service is available
 	if s.dbService == nil {
 		http.Error(w, "Database service not available", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Parse request body
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var request struct {
 		Query string `json:"query"`
 		Args  []any  `json:"args"`
@@ -200,7 +355,13 @@ func (s *Server) handleDatabaseQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Execute the query
+	// Only allow read queries to limit blast radius if credentials are compromised.
+	trimmed := strings.TrimSpace(strings.ToUpper(request.Query))
+	if !strings.HasPrefix(trimmed, "SELECT") && !strings.HasPrefix(trimmed, "WITH") {
+		http.Error(w, "Only SELECT queries are allowed via the HTTP API", http.StatusForbidden)
+		return
+	}
+
 	rows, err := s.dbService.Query(request.Query, request.Args...)
 	if err != nil {
 		log.Printf("Error executing database query: %v", err)
@@ -209,7 +370,6 @@ func (s *Server) handleDatabaseQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
 		log.Printf("Error getting column names: %v", err)
@@ -217,46 +377,39 @@ func (s *Server) handleDatabaseQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prepare result
 	var results []map[string]any
 	for rows.Next() {
-		// Create a slice of any to hold the values
 		values := make([]any, len(columns))
 		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
 
-		// Scan the result into the values
 		if err := rows.Scan(valuePtrs...); err != nil {
 			log.Printf("Error scanning row: %v", err)
 			http.Error(w, fmt.Sprintf("Error scanning row: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		// Create a map for this row
 		row := make(map[string]any)
 		for i, col := range columns {
 			val := values[i]
-			// Handle null values
-			if val == nil {
-				row[col] = nil
+			// Database drivers may return []byte for text columns; convert to string.
+			if b, ok := val.([]byte); ok {
+				row[col] = string(b)
 			} else {
-				// Convert to string for simplicity
-				row[col] = fmt.Sprintf("%v", val)
+				row[col] = val
 			}
 		}
 		results = append(results, row)
 	}
 
-	// Check for errors from iterating over rows
 	if err := rows.Err(); err != nil {
 		log.Printf("Error iterating over rows: %v", err)
 		http.Error(w, fmt.Sprintf("Error iterating over rows: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Return the result
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -264,46 +417,39 @@ func (s *Server) handleDatabaseQuery(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetMetrics handles requests to get metrics for all functions
 func (s *Server) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Get metrics from the registry
 	metrics := s.registry.GetMetrics()
 
-	// Return the metrics
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"metrics": metrics,
 	})
 }
 
-// handleGetFunctionMetrics handles requests to get metrics for a specific function
 func (s *Server) handleGetFunctionMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Extract function name from URL path
-	path := strings.TrimPrefix(r.URL.Path, "/metrics/")
-	if path == "" {
+	name := strings.TrimPrefix(r.URL.Path, "/metrics/")
+	if name == "" {
 		http.Error(w, "Function name is required", http.StatusBadRequest)
 		return
 	}
 
-	// Get metrics for the function
-	metrics, exists := s.registry.GetFunctionMetrics(path)
+	metrics, exists := s.registry.GetFunctionMetrics(name)
 	if !exists {
-		http.Error(w, fmt.Sprintf("Function %s not found", path), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("Function %s not found", name), http.StatusNotFound)
 		return
 	}
 
-	// Return the metrics
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(metrics)

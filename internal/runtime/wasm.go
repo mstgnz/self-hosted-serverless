@@ -1,28 +1,42 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"github.com/tetratelabs/wazero/sys"
 )
+
+type cachedModule struct {
+	module  wazero.CompiledModule
+	modTime time.Time
+}
 
 // WasmRuntime represents a WebAssembly runtime for executing WASM functions
 type WasmRuntime struct {
 	runtime wazero.Runtime
+	cache   map[string]cachedModule
+	mu      sync.RWMutex
 }
+
+var instanceCounter atomic.Int64
 
 // NewWasmRuntime creates a new WebAssembly runtime
 func NewWasmRuntime() (*WasmRuntime, error) {
-	// Create a new WebAssembly runtime with context
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
 
-	// Instantiate WASI
 	_, err := wasi_snapshot_preview1.Instantiate(ctx, r)
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate WASI: %w", err)
@@ -30,46 +44,119 @@ func NewWasmRuntime() (*WasmRuntime, error) {
 
 	return &WasmRuntime{
 		runtime: r,
+		cache:   make(map[string]cachedModule),
 	}, nil
 }
 
-// ExecuteFunction executes a WebAssembly function
-func (r *WasmRuntime) ExecuteFunction(wasmFile string, functionName string, args ...any) (any, error) {
-	// Create context
-	ctx := context.Background()
+// getCompiledModule returns a cached compiled module, or compiles and caches it.
+func (r *WasmRuntime) getCompiledModule(ctx context.Context, wasmFile string) (wazero.CompiledModule, error) {
+	info, err := os.Stat(wasmFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read WebAssembly file: %w", err)
+	}
+	modTime := info.ModTime()
 
-	// Read the WebAssembly module
+	r.mu.RLock()
+	cached, ok := r.cache[wasmFile]
+	r.mu.RUnlock()
+
+	if ok && cached.modTime.Equal(modTime) {
+		return cached.module, nil
+	}
+
 	wasmBytes, err := os.ReadFile(wasmFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read WebAssembly file: %w", err)
 	}
 
-	// Compile the WebAssembly module
 	module, err := r.runtime.CompileModule(ctx, wasmBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile WebAssembly module: %w", err)
 	}
 
-	// Configure the module
+	r.mu.Lock()
+	r.cache[wasmFile] = cachedModule{module: module, modTime: modTime}
+	r.mu.Unlock()
+
+	return module, nil
+}
+
+// ExecuteWASI runs a WASI command module using JSON-over-stdio for I/O.
+// The module reads its input as a JSON object from stdin and must write
+// its result as a JSON value to stdout before exiting with code 0.
+func (r *WasmRuntime) ExecuteWASI(wasmFile string, input map[string]any) (any, error) {
+	ctx := context.Background()
+
+	module, err := r.getCompiledModule(ctx, wasmFile)
+	if err != nil {
+		return nil, err
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal input: %w", err)
+	}
+
+	var stdout bytes.Buffer
+	// Each instantiation needs a unique name so the runtime can host concurrent calls.
+	instanceName := fmt.Sprintf("%s#%d", filepath.Base(wasmFile), instanceCounter.Add(1))
+	config := wazero.NewModuleConfig().
+		WithStdout(&stdout).
+		WithStderr(os.Stderr).
+		WithStdin(bytes.NewReader(inputJSON)).
+		WithName(instanceName)
+
+	// InstantiateModule runs _start automatically for WASI command modules.
+	// When the module calls proc_exit(0), wazero returns a *sys.ExitError with code 0.
+	_, err = r.runtime.InstantiateModule(ctx, module, config)
+	if err != nil {
+		var exitErr *sys.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 0 {
+			return nil, fmt.Errorf("failed to execute WebAssembly module: %w", err)
+		}
+		// exit code 0 = normal completion
+	}
+
+	if stdout.Len() == 0 {
+		return nil, nil
+	}
+
+	var result any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil {
+		// Return raw string output if it isn't valid JSON.
+		return stdout.String(), nil
+	}
+	return result, nil
+}
+
+// ExecuteFunction calls a named export directly with primitive numeric arguments.
+// Suitable for low-level WASM modules; prefer ExecuteWASI for application-level functions.
+func (r *WasmRuntime) ExecuteFunction(wasmFile string, functionName string, args ...any) (any, error) {
+	ctx := context.Background()
+
+	module, err := r.getCompiledModule(ctx, wasmFile)
+	if err != nil {
+		return nil, err
+	}
+
+	instanceName := fmt.Sprintf("%s#%d", filepath.Base(wasmFile), instanceCounter.Add(1))
 	config := wazero.NewModuleConfig().
 		WithStdout(os.Stdout).
 		WithStderr(os.Stderr).
-		WithStdin(os.Stdin)
+		WithStdin(os.Stdin).
+		WithName(instanceName)
 
-	// Instantiate the module
 	instance, err := r.runtime.InstantiateModule(ctx, module, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate WebAssembly module: %w", err)
 	}
 	defer instance.Close(ctx)
 
-	// Get the function
 	fn := instance.ExportedFunction(functionName)
 	if fn == nil {
 		return nil, fmt.Errorf("function %s not found", functionName)
 	}
 
-	// Convert arguments to WebAssembly values
 	wasmArgs := make([]uint64, len(args))
 	for i, arg := range args {
 		switch v := arg.(type) {
@@ -94,13 +181,11 @@ func (r *WasmRuntime) ExecuteFunction(wasmFile string, functionName string, args
 		}
 	}
 
-	// Call the function
 	results, err := fn.Call(ctx, wasmArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call function: %w", err)
 	}
 
-	// Return the result
 	if len(results) == 0 {
 		return nil, nil
 	}
@@ -112,54 +197,6 @@ func (r *WasmRuntime) Close() error {
 	if r.runtime != nil {
 		ctx := context.Background()
 		return r.runtime.Close(ctx)
-	}
-	return nil
-}
-
-// WasmFunctionHandler implements the FunctionHandler interface for WebAssembly functions
-type WasmFunctionHandler struct {
-	wasmFile     string
-	functionName string
-	runtime      *WasmRuntime
-}
-
-// NewWasmFunctionHandler creates a new WebAssembly function handler
-func NewWasmFunctionHandler(wasmFile, functionName string) (*WasmFunctionHandler, error) {
-	runtime, err := NewWasmRuntime()
-	if err != nil {
-		return nil, err
-	}
-
-	return &WasmFunctionHandler{
-		wasmFile:     wasmFile,
-		functionName: functionName,
-		runtime:      runtime,
-	}, nil
-}
-
-// Execute executes the WebAssembly function
-func (h *WasmFunctionHandler) Execute(input map[string]any) (any, error) {
-	// Convert input to arguments
-	// This is a simplified implementation; in a real-world scenario,
-	// you would need to serialize the input to a format that the WebAssembly function can understand
-	args := make([]any, 0)
-	for _, value := range input {
-		switch v := value.(type) {
-		case int, int32, int64, uint, uint32, uint64, float32, float64:
-			args = append(args, v)
-		default:
-			return nil, errors.New("unsupported input type")
-		}
-	}
-
-	// Execute the function
-	return h.runtime.ExecuteFunction(h.wasmFile, h.functionName, args...)
-}
-
-// Close closes the WebAssembly function handler
-func (h *WasmFunctionHandler) Close() error {
-	if h.runtime != nil {
-		return h.runtime.Close()
 	}
 	return nil
 }
